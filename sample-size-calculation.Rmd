@@ -1,0 +1,128 @@
+---
+title: "Sample Size Calculation"
+date: "`r Sys.Date()`"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Come up with a sample size calculation for the problem we worked on, assuming the following:
+
+1. Every subject gets all three tests: PCR, dog, and antigen
+2. PCR test is considered perfectly accurate gold standard
+3. Different people are considered independent
+4. Dog tests are done with a large population of random dogs trained with a consistent and replicable program- i.e. you can treat this test the same way you treat the antigen test.
+5. All tests are interpreted as +/- results, never as inconclusive
+6. We have conservative guesses we can use for population prevalence of disease and antigen test sensitivity for purposes of sample size estimation, but we don't want to treat those as known for our estimator because of possible population shifts
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(simcausal)
+library(biostatUZH)
+```
+
+Since we are interested in testing if the sensitivity of dog test is significantly greater than sensitivity for antigen test, we will conduct a one-tailed hypothesis test.
+
+Sensitvity is a proportion calculated from counts of a binary outcome (# of detected true positives/total # of true positives). Since the dog test and antigen test are both conducted on every sample, the sensitivity proportions are paired. Based on this, we will conduct McNemar's test on paired proportions, which is used to test the difference between proportions of paired samples.  
+
+***Our one-tailed hypothesis test***
+
+Ho: (p1) dog test sensitivity =< (p2) antigen test sensitivity
+
+Ha: (p1) dog test sensitivity > (p2) antigen test sensitivity
+
+Calculate sample size using the biostatUZH package, which contains a tool to calculate sample size to test the null hypothesis of the McNemar test.
+
+- For this calculation, we will rely on estimates of sensitvity for both the dog COVID-19 test and the antigen COVID-19 test obtained from previous literature. 
+
+- **Power** = the probability of correctly rejecting the null hypothesis. In this calculation, we specify that we want 80% power.
+```{r sample size calculation}
+# find values for sensitivity estimates for antigen test & dog detection test from literature
+antigen_sens <- 0.73 
+dog_sens <- 0.82
+
+# conduct sample size calculation with above values to find n (output is min, max, mid sample size)
+sample_size_range <- sampleSizeMcNemar(p1 = antigen_sens, p2 = dog_sens, alpha =0.05, power = 0.8)
+# https://pubmed.ncbi.nlm.nih.gov/1410964/
+
+min_sample_size <- sample_size_range[[1]]
+
+```
+
+If we want to check that our sample size calculation 'worked', we can conduct hypothesis test many times, using repeated samples from simulated data to see what percentage of times you correctly reject the null hypothesis. The percentage of times the null hypothesis is rejected should be similar to the % power specified when calculating sample size. 
+
+Simulate data
+```{r simulate data}
+# unknown data generating process
+sample_dgp <- function(n) {
+  data <- tibble(
+    # let's say 70% of the people that are tested in hospital setting actually have COVID-19
+    true_positive_PCR = rbern(n, 0.7),
+    
+    # based on literature, the dog test should detect a true positive 82% of the time
+    dog_test = rbern(n, prob = case_when(
+      true_positive_PCR == 1 ~ (0.82 * true_positive_PCR),
+      true_positive_PCR == 0 ~ 0)),
+    
+    # based on literature, the rapid antigen test should detect a true positive 73% of the time using nasopharyngeal samples 
+    antigen_test = rbern(n, prob = case_when(
+      true_positive_PCR == 1 ~ (0.73 * true_positive_PCR),
+      true_positive_PCR == 0 ~ 0))
+  )
+}
+
+```
+
+Define the hypothesis test. This includes:
+
+- Creating a 2x2 contigency table with counts of sampled data
+- Running McNemar's test
+
+```{r hypothesis test}
+hypothesisTest <- function(df) {
+  # fill out cells of a 2x2 table
+  a <- filter(df, true_positive_PCR == 1 & dog_test == 1 & antigen_test == 1) %>%
+    nrow()
+  b <- filter(df, true_positive_PCR == 1 & dog_test == 1 & antigen_test == 0) %>%
+    nrow()
+  c <- filter(df, true_positive_PCR == 1 & dog_test == 0 & antigen_test == 1) %>%
+    nrow()
+  d <- filter(df, true_positive_PCR == 1 & dog_test == 0 & antigen_test == 0) %>%
+    nrow()
+  
+  # Perform McNemar's test 
+  # referemce: https://cran.r-project.org/web/packages/exact2x2/exact2x2.pdf
+  test_result <- exact2x2::mcnemarExactDP(n = a+b+c+d, # n = total number of pairs 
+                                          m = b+c, # m = number of pairs with mismatched responses
+                                          x = b, # x = number of pairs with response of 1 for treatment and 0 for control
+                                          nullparm = 0, #nullparm null parameter value for the difference in proportions: proportion with events on treatment minus proportion with events on control
+                                          alternative = 'greater', # alternative alternative hypothesis, must be one of "two.sided", "greater" or "less"
+                                          conf.level = 0.95) %>% # conf.level confidence level for the returned confidence interval
+    broom::tidy() %>%
+    rename('x/n' = estimate1, '(m-x)/n' = estimate2, difference = estimate3) %>%
+    select(contains(c('difference', 'p.value', 'conf.'))) %>%
+    distinct()
+}
+```
+
+Conduct hypothesis test many times, using repeated samples from simulated data. Then calculate what percentage of experiments in which the null hypothesis was correctly rejected. 
+```{r simulate repeated experiments, warning=FALSE}
+# define experiment: take sample of size n and conduct hypothesis test
+experiment <- function(n) {
+  sample_dgp(n) %>%
+    hypothesisTest()
+}
+
+# repeat experiment many times
+test_results = 1e3 %>%
+  rerun(experiment(n = min_sample_size)) %>%
+  bind_rows()
+
+# find proportion of times the null hypothesis was correctly rejected
+reject_Ho_count <- nrow(filter(test_results, p.value < 0.05))
+total_num_experiments <- nrow(test_results)
+
+percent_reject_Ho <- (reject_Ho_count / total_num_experiments) * 100
+
+print(paste0('Using the minimum sample size of ', min_sample_size, ', the null hypothesis that the sensitivity of the dog test is less than or equal to the sensitivity of the antigen test was correctly rejected ', percent_reject_Ho, '% of the time, over repeated experiments.'))
+```
